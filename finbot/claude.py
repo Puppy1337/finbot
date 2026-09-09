@@ -102,9 +102,13 @@ class Claude:
             body["tools"] = tools
         if tool_choice:
             body["tool_choice"] = tool_choice
+        # Большие ответы (выписки) генерируются долго — ждём до 10 минут, а не 2
+        timeout = httpx.Timeout(600.0 if max_tokens >= 8000 else 180.0, connect=15.0)
         for attempt in range(3):
             try:
-                r = await self.client.post(f"{self.base_url}/v1/messages", json=body)
+                r = await self.client.post(f"{self.base_url}/v1/messages", json=body, timeout=timeout)
+            except httpx.TimeoutException as e:
+                raise ClaudeError("не дождался ответа — документ слишком большой, пришлите выписку за меньший период") from e
             except httpx.HTTPError as e:
                 if attempt == 2:
                     raise ClaudeError(f"Сеть: {e}") from e

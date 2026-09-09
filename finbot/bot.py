@@ -422,6 +422,8 @@ class FinBot:
             await self.tg.send_message(chat_id, "📄 Это не похоже на PDF-файл.")
             return
         name = doc.get("file_name") or "document.pdf"
+        if size > 200 * 1024:
+            await self.tg.send_message(chat_id, "📄 Читаю выписку… Большой файл может занять несколько минут.")
         await self.process_input(user, chat_id, text=caption, source="pdf", pdf=pdf, pdf_name=name,
                                  prefix=f"📄 <i>{esc(name)}</i>\n\n")
 
