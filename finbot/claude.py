@@ -35,6 +35,7 @@ SYSTEM_PROMPT = """Ты — личный финансовый аналитик �
 - Не выдумывай операции. Сомневаешься — не записывай, а спроси в reply.
 
 Правила для reply (ФОРМАТ ОБЯЗАТЕЛЕН):
+- reply — это ВЕСЬ твой ответ целиком. Никаких «см. ниже», «полный разбор далее», «не могу ответить в этом формате» — весь текст, включая длинный анализ, пиши прямо в reply.
 - Пиши структурно: короткие абзацы, разделённые ПУСТОЙ строкой. Каждый смысловой блок начинай с подходящего эмодзи. Перечисления — отдельными строками через «• ». Ключевые цифры и выводы выделяй **жирным** (двойные звёздочки). Другую markdown-разметку (#, таблицы, ссылки) не используй.
 - Если записаны операции — не перечисляй их (бот покажет сам), а дай 1–3 предложения: конкретный совет или наблюдение с опорой на цифры (бюджет, средний расход, цель).
 - Если это вопрос или просьба проанализировать — отвечай развёрнуто, столько, сколько нужно для полного ответа, с цифрами из контекста.
@@ -64,7 +65,9 @@ TOOL = {
                     "required": ["type", "amount", "currency", "category", "description", "date"],
                 },
             },
-            "reply": {"type": "string", "description": "Короткий ответ/совет пользователю на русском"},
+            "reply": {"type": "string", "description": "ПОЛНЫЙ ответ пользователю на русском. Это единственный текст, "
+                      "который увидит пользователь — никакого «см. ниже» не существует, после этого поля ничего не будет. "
+                      "Может быть длинным и многоабзацным, если вопрос этого требует."},
         },
         "required": ["transactions", "reply"],
     },
@@ -185,13 +188,29 @@ class Claude:
         return {"transactions": [], "reply": text_out.strip() or "Не понял, переформулируйте, пожалуйста."}
 
     async def analyze(self, context: str, prompt: str, max_tokens: int = 3000, instructions: str = "",
-                      history: Optional[list[dict]] = None) -> str:
-        """Развёрнутый анализ/ответ обычным текстом (без извлечения операций)."""
+                      history: Optional[list[dict]] = None, pdf_bytes: Optional[bytes] = None,
+                      pdf_name: str = "document.pdf", image_bytes: Optional[bytes] = None,
+                      image_media_type: str = "image/jpeg") -> str:
+        """Развёрнутый анализ/ответ обычным текстом (без извлечения операций). Можно приложить PDF/картинку."""
+        import base64
+
         extra = ("Сейчас пользователь запросил развёрнутый анализ или ответ на вопрос. Отвечай полно и конкретно: цифры, "
-                 "проценты, сравнения, что именно сократить и на сколько. Все суммы бери из контекста (там есть точная "
-                 "разбивка по месяцам и категориям из базы данных) — не пересчитывай на глаз. Соблюдай правила формата reply.")
+                 "проценты, сравнения, что именно сократить и на сколько. Суммы из базы бери из контекста (там есть точная "
+                 "разбивка по месяцам и категориям); если приложен документ — считай по нему, группируя операции по датам. "
+                 "Соблюдай правила формата reply: абзацы, эмодзи, • списки, **жирные** цифры.")
         system = self._system(context, instructions, extra)
-        messages = [*(history or []), {"role": "user", "content": prompt}]
+        content: list[dict] = []
+        if pdf_bytes:
+            content.append({"type": "document", "source": {"type": "base64", "media_type": "application/pdf",
+                                                            "data": base64.b64encode(pdf_bytes).decode()},
+                            "title": pdf_name})
+        if image_bytes:
+            content.append({"type": "image", "source": {"type": "base64", "media_type": image_media_type,
+                                                         "data": base64.b64encode(image_bytes).decode()}})
+        content.append({"type": "text", "text": prompt})
+        messages = [*(history or []), {"role": "user", "content": content}]
+        if pdf_bytes or image_bytes:
+            max_tokens = max(max_tokens, 8000)
         data = await self._messages(messages, system, max_tokens=max_tokens)
         return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
 

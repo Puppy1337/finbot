@@ -491,8 +491,20 @@ class FinBot:
                 parts.append("\n".join(warnings))
         elif skipped:
             parts.append(f"↩️ Все {skipped} операции уже были записаны раньше.")
+        # Страховка: из документа не извлечено ни одной операции — отвечаем обычным текстом с приложенным документом
+        if (pdf or image) and not lines and not skipped:
+            try:
+                question = text.strip() if text and len(text.strip()) > 3 else (
+                    "Разбери этот документ: если это выписка — посчитай расходы по месяцам и категориям и дай выводы; "
+                    "если другой документ — перескажи суть и дай финансовый комментарий.")
+                answer = await self.claude.analyze(ctx, question, instructions=instructions, pdf_bytes=pdf,
+                                                   pdf_name=pdf_name, image_bytes=image, image_media_type=image_mime)
+                if answer:
+                    result["reply"] = answer
+            except ClaudeError as e:
+                log.warning("fallback analyze: %s", e)
         # Если к документу был вопрос — отвечаем вторым запросом по свежей базе (точные суммы по месяцам)
-        if lines and (pdf or image) and text and len(text.strip()) > 3:
+        elif lines and (pdf or image) and text and len(text.strip()) > 3:
             try:
                 fresh_ctx = reports.build_context(self.db, uid, cur, tz)
                 answer = await self.claude.analyze(

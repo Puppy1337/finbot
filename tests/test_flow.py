@@ -176,6 +176,15 @@ async def run():
     assert "ЛИЧНЫЕ ПРАВИЛА" in CLAUDE_REQUESTS[-1]["system"] and "Переводы друзьям" in CLAUDE_REQUESTS[-1]["system"]
     await bot.handle_update(msg("/months"))
     assert "По месяцам" in SENT[-1]["text"] and "Транспорт" in SENT[-1]["text"], SENT[-1]["text"]
+    # PDF без извлечённых операций -> страховочный текстовый запрос с приложенным документом
+    CLAUDE_REPLY = {"transactions": [], "reply": "см. ниже полный разбор"}
+    n_req = len(CLAUDE_REQUESTS)
+    await bot.handle_update(msg(document={"file_id": "d1", "mime_type": "application/pdf",
+                                          "file_name": "st3.pdf", "file_size": 100}))
+    assert len(CLAUDE_REQUESTS) == n_req + 2
+    last = CLAUDE_REQUESTS[-1]
+    assert "tools" not in last and last["messages"][-1]["content"][0]["type"] == "document"
+    assert "меньше кофе" in SENT[-1]["text"] and "см. ниже" not in SENT[-1]["text"], SENT[-1]["text"]
     # слишком большой PDF
     await bot.handle_update(msg(document={"file_id": "d2", "mime_type": "application/pdf",
                                           "file_name": "big.pdf", "file_size": 50 * 1024 * 1024}))
