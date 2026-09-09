@@ -26,7 +26,8 @@ SYSTEM_PROMPT = """Ты — личный финансовый аналитик �
 - Категории расходов строго из списка: {expense_categories}.
 - Категории доходов строго из списка: {income_categories}. Для saving категория = "Накопления".
 - date: YYYY-MM-DD. Если дата не указана — сегодняшняя дата из контекста. «Вчера» = сегодня минус 1 день.
-- Скриншот банка: извлеки ВСЕ видимые операции (списания = expense, зачисления = income). Переводы между своими счетами не учитывай. Если суммы обрезаны или нечитаемы — пропусти, но упомяни в reply. Если на скриншоте нет операций (например, только баланс), верни пустой список и объясни в reply.
+- Скриншот банка или PDF-выписка: извлеки ВСЕ операции (списания = expense, зачисления = income). Переводы между своими счетами, погашение кредитки со своего счёта и внутренние конвертации не учитывай. Дату каждой операции бери из документа. Если суммы обрезаны или нечитаемы — пропусти, но упомяни в reply. Если операций нет (например, только баланс), верни пустой список и объясни в reply.
+- Если пользователь прислал PDF, который не является выпиской (договор, счёт, чек, тариф, статья о финансах), операции не извлекай (кроме чека — чек это одна трата), а в reply кратко перескажи суть документа и дай финансовый комментарий по нему.
 - Если пользователь упоминает цель («отложил 100 на отпуск»), укажи goal с названием цели.
 - Если в сообщении нет операций (вопрос, приветствие, просьба) — transactions пустой.
 - Не выдумывай операции. Сомневаешься — не записывай, а спроси в reply.
@@ -118,7 +119,8 @@ class Claude:
         raise ClaudeError("Claude API недоступен")
 
     async def process(self, context: str, text: Optional[str], history: list[dict],
-                      image_bytes: Optional[bytes] = None, image_media_type: str = "image/jpeg") -> dict:
+                      image_bytes: Optional[bytes] = None, image_media_type: str = "image/jpeg",
+                      pdf_bytes: Optional[bytes] = None, pdf_name: str = "document.pdf") -> dict:
         """Извлечь операции + сформировать ответ. Возвращает {"transactions": [...], "reply": str}."""
         import base64
 
@@ -129,12 +131,27 @@ class Claude:
                 "source": {"type": "base64", "media_type": image_media_type,
                            "data": base64.b64encode(image_bytes).decode()},
             })
-        user_text = text or ("Проанализируй скриншот и извлеки операции." if image_bytes else "")
+        if pdf_bytes:
+            content.append({
+                "type": "document",
+                "source": {"type": "base64", "media_type": "application/pdf",
+                           "data": base64.b64encode(pdf_bytes).decode()},
+                "title": pdf_name,
+            })
+        if text:
+            user_text = text
+        elif pdf_bytes:
+            user_text = f"Прочитай PDF «{pdf_name}». Если это банковская выписка — извлеки все операции; иначе перескажи суть."
+        elif image_bytes:
+            user_text = "Проанализируй скриншот и извлеки операции."
+        else:
+            user_text = ""
         content.append({"type": "text", "text": user_text})
 
         messages = [*history, {"role": "user", "content": content}]
         system = f"{self.system}\n\n=== КОНТЕКСТ ПОЛЬЗОВАТЕЛЯ ===\n{context}"
-        data = await self._messages(messages, system, max_tokens=2000, tools=[TOOL],
+        max_tokens = 8000 if pdf_bytes else 2000  # выписка может содержать сотни операций
+        data = await self._messages(messages, system, max_tokens=max_tokens, tools=[TOOL],
                                     tool_choice={"type": "tool", "name": "process_message"})
         for block in data.get("content", []):
             if block.get("type") == "tool_use" and block.get("name") == "process_message":

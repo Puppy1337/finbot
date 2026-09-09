@@ -19,6 +19,8 @@ from .telegram import Telegram, esc, inline_keyboard
 
 log = logging.getLogger(__name__)
 
+MAX_PDF_BYTES = 20 * 1024 * 1024  # лимит Telegram Bot API на скачивание файлов
+
 COMMANDS = [
     ("start", "Начало работы"),
     ("help", "Как пользоваться"),
@@ -40,6 +42,7 @@ HELP = """<b>Как пользоваться</b>
 ✍️ <b>Просто пишите</b>: «кофе 4.5», «такси 12 евро вчера», «зарплата 3000», «отложил 200 на отпуск».
 🎤 <b>Голосом</b>: наговорите траты голосовым сообщением.
 📸 <b>Скриншот из банка</b>: пришлите картинку — бот вытащит операции.
+📄 <b>PDF-выписка</b>: пришлите файл из банка — бот разберёт все операции (или перескажет любой другой финансовый документ).
 ❓ <b>Вопросы</b>: «сколько я потратил на еду?», «хватит ли до зарплаты?», «на чём сэкономить?».
 
 <b>Команды</b>
@@ -164,8 +167,11 @@ class FinBot:
             elif msg.get("document") and str(msg["document"].get("mime_type", "")).startswith("image/"):
                 await self.handle_photo(user, chat_id, msg["document"]["file_id"], msg.get("caption"),
                                         msg["document"]["mime_type"])
+            elif msg.get("document") and (str(msg["document"].get("mime_type", "")) == "application/pdf"
+                                          or str(msg["document"].get("file_name", "")).lower().endswith(".pdf")):
+                await self.handle_pdf(user, chat_id, msg["document"], msg.get("caption"))
             else:
-                await self.tg.send_message(chat_id, "Я понимаю текст, голосовые и скриншоты 🙂 /help")
+                await self.tg.send_message(chat_id, "Я понимаю текст, голосовые, скриншоты и PDF 🙂 /help")
 
     # ---------- команды ----------
     async def handle_command(self, user, chat_id: int, text: str) -> None:
@@ -373,15 +379,32 @@ class FinBot:
             mime = "image/jpeg"
         await self.process_input(user, chat_id, text=caption, source="photo", image=image, image_mime=mime)
 
+    async def handle_pdf(self, user, chat_id: int, doc: dict, caption: Optional[str]) -> None:
+        size = int(doc.get("file_size") or 0)
+        if size > MAX_PDF_BYTES:
+            await self.tg.send_message(chat_id, f"📄 Файл слишком большой ({size // 1024 // 1024} МБ). "
+                                       f"Максимум {MAX_PDF_BYTES // 1024 // 1024} МБ — выгрузите выписку за меньший период.")
+            return
+        await self.tg.send_chat_action(chat_id, "upload_document")
+        pdf = await self.tg.download_file(doc["file_id"])
+        if not pdf.startswith(b"%PDF"):
+            await self.tg.send_message(chat_id, "📄 Это не похоже на PDF-файл.")
+            return
+        name = doc.get("file_name") or "document.pdf"
+        await self.process_input(user, chat_id, text=caption, source="pdf", pdf=pdf, pdf_name=name,
+                                 prefix=f"📄 <i>{esc(name)}</i>\n\n")
+
     # ---------- главный обработчик ----------
     async def process_input(self, user, chat_id: int, text: Optional[str], source: str,
-                            image: Optional[bytes] = None, image_mime: str = "image/jpeg", prefix: str = "") -> None:
+                            image: Optional[bytes] = None, image_mime: str = "image/jpeg", prefix: str = "",
+                            pdf: Optional[bytes] = None, pdf_name: str = "document.pdf") -> None:
         uid, cur, tz = user["user_id"], user["currency"], self.s.timezone
         await self.tg.send_chat_action(chat_id)
         ctx = reports.build_context(self.db, uid, cur, tz)
         hist = self.history.setdefault(uid, [])
         try:
-            result = await self.claude.process(ctx, text, hist, image_bytes=image, image_media_type=image_mime)
+            result = await self.claude.process(ctx, text, hist, image_bytes=image, image_media_type=image_mime,
+                                               pdf_bytes=pdf, pdf_name=pdf_name)
         except ClaudeError as e:
             log.error("Claude: %s", e)
             await self.tg.send_message(chat_id, f"⚠️ Не удалось связаться с аналитиком: {esc(e)}")
@@ -409,7 +432,7 @@ class FinBot:
             if goal:
                 g = self.db.find_goal(uid, goal)
                 goal = g["name"] if g else goal
-            if source == "photo" and self.db.is_duplicate(uid, amount, currency, tx_date, desc):
+            if source in ("photo", "pdf") and self.db.is_duplicate(uid, amount, currency, tx_date, desc):
                 skipped += 1
                 continue
             amount_base = await self.rates.convert(amount, currency, cur)
@@ -422,7 +445,11 @@ class FinBot:
 
         parts = [prefix] if prefix else []
         if lines:
-            parts.append("✅ <b>Записал:</b>\n" + "\n".join(lines))
+            if len(lines) > 25:
+                shown = "\n".join(lines[:25]) + f"\n… и ещё {len(lines) - 25}"
+            else:
+                shown = "\n".join(lines)
+            parts.append(f"✅ <b>Записал ({len(lines)}):</b>\n" + shown)
             if skipped:
                 parts.append(f"↩️ Пропустил {skipped} — уже были записаны.")
             warnings = self.budget_warnings(uid, cur, today)
@@ -432,11 +459,12 @@ class FinBot:
             parts.append(f"↩️ Все {skipped} операции уже были записаны раньше.")
         if result["reply"]:
             parts.append(("💡 " if lines else "") + esc(result["reply"]))
-        markup = inline_keyboard([[("↩️ Отменить", "undo:" + ",".join(map(str, saved_ids)))]]) if saved_ids else None
+        # callback_data ограничен 64 байтами — передаём диапазон id (записи одного сообщения идут подряд)
+        markup = inline_keyboard([[("↩️ Отменить", f"undo:{min(saved_ids)}-{max(saved_ids)}")]]) if saved_ids else None
         await self.tg.send_message(chat_id, "\n\n".join(p for p in parts if p).strip() or "🤔", reply_markup=markup)
 
         # короткая память диалога
-        user_summary = text or "[скриншот]"
+        user_summary = text or ("[PDF]" if pdf else "[скриншот]")
         if lines:
             user_summary += "\n[записано: " + "; ".join(re.sub(r"<[^>]+>", "", l) for l in lines) + "]"
         hist.append(history_entry("user", user_summary))
@@ -468,7 +496,12 @@ class FinBot:
         chat_id = msg.get("chat", {}).get("id")
         uid = cq.get("from", {}).get("id")
         if data.startswith("undo:") and chat_id and uid:
-            ids = [int(x) for x in data[5:].split(",") if x.isdigit()]
+            spec = data[5:]
+            if "-" in spec:
+                a, b = spec.split("-", 1)
+                ids = list(range(int(a), int(b) + 1)) if a.isdigit() and b.isdigit() else []
+            else:
+                ids = [int(x) for x in spec.split(",") if x.isdigit()]
             n = self.db.delete_transactions(uid, ids)
             await self.tg.answer_callback(cq["id"], f"Удалено записей: {n}")
             old = msg.get("text") or ""

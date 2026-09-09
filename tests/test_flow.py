@@ -22,6 +22,7 @@ from finbot.stt import SpeechToText  # noqa: E402
 from finbot.telegram import Telegram  # noqa: E402
 
 SENT: list[dict] = []
+DOWNLOADS: set = set()
 CLAUDE_REQUESTS: list[dict] = []
 CLAUDE_REPLY = {"transactions": [], "reply": "ok"}
 
@@ -29,12 +30,13 @@ CLAUDE_REPLY = {"transactions": [], "reply": "ok"}
 def tg_handler(request: httpx.Request) -> httpx.Response:
     method = request.url.path.split("/")[-1]
     if request.url.path.startswith("/file/"):
-        return httpx.Response(200, content=b"\x89PNG fake")
+        return httpx.Response(200, content=b"%PDF-1.4 fake" if "d1" in DOWNLOADS else b"\x89PNG fake")
     body = {}
     if request.headers.get("content-type", "").startswith("application/json"):
         body = json.loads(request.content)
     SENT.append({"method": method, **({k: v for k, v in body.items()} if body else {})})
     if method == "getFile":
+        DOWNLOADS.clear(); DOWNLOADS.add(body.get("file_id", ""))
         return httpx.Response(200, json={"ok": True, "result": {"file_path": "voice/1.ogg"}})
     if method in ("sendPhoto", "sendDocument"):
         SENT[-1]["multipart"] = True
@@ -137,6 +139,29 @@ async def run():
     await bot.handle_update(msg(photo=[{"file_id": "p1"}], caption="вот"))
     assert CLAUDE_REQUESTS[-1]["messages"][-1]["content"][0]["type"] == "image"
     assert "Пропустил 1" in SENT[-1]["text"] and "1 000 USD" in SENT[-1]["text"], SENT[-1]["text"]
+
+    # 7b. PDF-выписка: документ уходит в Claude, много операций, кнопка отмены влезает в 64 байта
+    CLAUDE_REPLY = {"transactions": [
+        {"type": "expense", "amount": 1 + i, "currency": "EUR", "category": "Еда", "description": f"магазин {i}",
+         "date": (today - timedelta(days=i % 5)).isoformat()} for i in range(30)], "reply": "Выписка разобрана."}
+    await bot.handle_update(msg(document={"file_id": "d1", "mime_type": "application/pdf",
+                                          "file_name": "statement.pdf", "file_size": 12345}))
+    req = CLAUDE_REQUESTS[-1]
+    assert req["messages"][-1]["content"][0]["type"] == "document", req["messages"][-1]["content"][0]
+    assert req["messages"][-1]["content"][0]["source"]["media_type"] == "application/pdf"
+    assert req["max_tokens"] == 8000
+    out = SENT[-1]
+    assert "statement.pdf" in out["text"] and "Записал (30)" in out["text"] and "и ещё 5" in out["text"], out["text"]
+    cb = out["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+    assert len(cb.encode()) <= 64 and "-" in cb, cb
+    before = len(db.all_transactions(1))
+    await bot.handle_update({"update_id": 10, "callback_query": {
+        "id": "cb2", "from": {"id": 1}, "data": cb, "message": {"message_id": 6, "chat": {"id": 1}, "text": "x"}}})
+    assert len(db.all_transactions(1)) == before - 30
+    # слишком большой PDF
+    await bot.handle_update(msg(document={"file_id": "d2", "mime_type": "application/pdf",
+                                          "file_name": "big.pdf", "file_size": 50 * 1024 * 1024}))
+    assert "слишком большой" in SENT[-1]["text"]
 
     # 8. вопрос без операций
     CLAUDE_REPLY = {"transactions": [], "reply": "Вы потратили 15 USD."}
