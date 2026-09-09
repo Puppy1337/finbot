@@ -1,0 +1,13 @@
+services:
+  finbot:
+    build: .
+    container_name: finbot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/app/data      # база данных сохраняется на диске сервера
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
