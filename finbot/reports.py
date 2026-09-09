@@ -107,6 +107,17 @@ def build_context(db: Database, user_id: int, base_cur: str, tz: str) -> str:
             parts.append(f"«{g['name']}»: накоплено {saved:.2f} из {g['target']:.2f}{dl}")
         lines.append("Цели накопления: " + "; ".join(parts))
 
+    monthly = db.monthly_by_category(user_id, 6, "expense")
+    if len(monthly) > 1 or (monthly and list(monthly)[0] != today.strftime("%Y-%m")):
+        inc_m = db.monthly_by_category(user_id, 6, "income")
+        rows = []
+        for ym, cats in monthly.items():
+            total = sum(cats.values())
+            inc = sum(inc_m.get(ym, {}).values())
+            top = "; ".join(f"{c} {v:.2f}" for c, v in list(cats.items())[:10])
+            rows.append(f"{ym}: расходы {total:.2f}" + (f", доходы {inc:.2f}" if inc else "") + f" — {top}")
+        lines.append("Точная разбивка по месяцам (из базы, все валюты уже переведены в базовую):\n" + "\n".join(rows))
+
     recent = db.recent_transactions(user_id, 12)
     if recent:
         lines.append("Последние операции: " + "; ".join(
@@ -212,6 +223,37 @@ def goals_report(db: Database, user_id: int, base_cur: str, tz: str) -> str:
         lines.append("")
     lines.append("Удалить цель: <code>/goal удалить Название</code>")
     return "\n".join(lines)
+
+
+MONTH_NAMES = ["", "январь", "февраль", "март", "апрель", "май", "июнь", "июль", "август", "сентябрь",
+               "октябрь", "ноябрь", "декабрь"]
+
+
+def months_report(db: Database, user_id: int, base_cur: str, months: int = 6) -> str:
+    exp = db.monthly_by_category(user_id, months, "expense")
+    inc = db.monthly_by_category(user_id, months, "income")
+    if not exp and not inc:
+        return "Пока нет данных ни за один месяц."
+    lines = [f"<b>По месяцам</b> (последние {months})", ""]
+    prev_total = None
+    for ym in sorted(set(exp) | set(inc))[-months:]:
+        y, m = ym.split("-")
+        cats = exp.get(ym, {})
+        total = sum(cats.values())
+        inc_total = sum(inc.get(ym, {}).values())
+        delta = ""
+        if prev_total:
+            pct = (total - prev_total) / prev_total * 100
+            delta = f" ({'+' if pct >= 0 else ''}{pct:.0f}% к пред.)"
+        lines.append(f"📅 <b>{MONTH_NAMES[int(m)].capitalize()} {y}</b>: 💸 {fmt(total, base_cur)}{delta}"
+                     + (f" · 💰 {fmt(inc_total, base_cur)}" if inc_total else ""))
+        for c, v in list(cats.items())[:6]:
+            lines.append(f"   • {esc(c)}: {fmt(v, base_cur)} ({v / total * 100:.0f}%)" if total else f"   • {esc(c)}")
+        if len(cats) > 6:
+            lines.append(f"   • … ещё {len(cats) - 6} категорий")
+        lines.append("")
+        prev_total = total
+    return "\n".join(lines).rstrip()
 
 
 def export_csv(db: Database, user_id: int) -> bytes:

@@ -82,7 +82,14 @@ class Database:
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        """Добавление колонок в существующие базы."""
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(users)").fetchall()}
+        if "instructions" not in cols:
+            self.conn.execute("ALTER TABLE users ADD COLUMN instructions TEXT NOT NULL DEFAULT ''")
 
     # ---------- пользователи ----------
     def ensure_user(self, user_id: int, name: str, default_currency: str) -> sqlite3.Row:
@@ -106,6 +113,22 @@ class Database:
     def set_remind_time(self, user_id: int, value: Optional[str]) -> None:
         self.conn.execute("UPDATE users SET remind_time=? WHERE user_id=?", (value, user_id))
         self.conn.commit()
+
+    def set_instructions(self, user_id: int, text: str) -> None:
+        self.conn.execute("UPDATE users SET instructions=? WHERE user_id=?", (text, user_id))
+        self.conn.commit()
+
+    def monthly_by_category(self, user_id: int, months: int = 6, type: str = "expense") -> dict[str, dict[str, float]]:
+        """{'2026-07': {'Еда': 120.0, ...}, ...} за последние N месяцев, по данным базы."""
+        rows = self.conn.execute(
+            "SELECT substr(tx_date,1,7) AS ym, category, SUM(amount_base) AS s FROM transactions "
+            "WHERE user_id=? AND type=? GROUP BY ym, category ORDER BY ym, s DESC", (user_id, type)
+        ).fetchall()
+        out: dict[str, dict[str, float]] = {}
+        for r in rows:
+            out.setdefault(r["ym"], {})[r["category"]] = float(r["s"])
+        keys = sorted(out)[-months:]
+        return {k: out[k] for k in keys}
 
     def set_weekly_report(self, user_id: int, enabled: bool) -> None:
         self.conn.execute("UPDATE users SET weekly_report=? WHERE user_id=?", (int(enabled), user_id))

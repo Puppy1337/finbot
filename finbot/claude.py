@@ -1,8 +1,10 @@
 """Клиент Claude (Anthropic Messages API) на httpx — «мозг» бота."""
 from __future__ import annotations
 
+import html
 import json
 import logging
+import re
 from typing import Any, Optional
 
 import httpx
@@ -32,10 +34,12 @@ SYSTEM_PROMPT = """Ты — личный финансовый аналитик �
 - Если в сообщении нет операций (вопрос, приветствие, просьба) — transactions пустой.
 - Не выдумывай операции. Сомневаешься — не записывай, а спроси в reply.
 
-Правила для reply:
-- 1–3 предложения. Если записаны операции — не перечисляй их (бот покажет сам), а дай один конкретный совет или наблюдение с опорой на цифры (бюджет, средний расход, цель). Если траты обычные и советовать нечего — короткая ремарка.
-- Если это вопрос — ответь по существу, с цифрами из контекста.
-- Без markdown-разметки (звёздочек, решёток). Можно эмодзи, умеренно.
+Правила для reply (ФОРМАТ ОБЯЗАТЕЛЕН):
+- Пиши структурно: короткие абзацы, разделённые ПУСТОЙ строкой. Каждый смысловой блок начинай с подходящего эмодзи. Перечисления — отдельными строками через «• ». Ключевые цифры и выводы выделяй **жирным** (двойные звёздочки). Другую markdown-разметку (#, таблицы, ссылки) не используй.
+- Если записаны операции — не перечисляй их (бот покажет сам), а дай 1–3 предложения: конкретный совет или наблюдение с опорой на цифры (бюджет, средний расход, цель).
+- Если это вопрос или просьба проанализировать — отвечай развёрнуто, столько, сколько нужно для полного ответа, с цифрами из контекста.
+- Разбивка по месяцам/неделям/категориям: у каждой операции есть дата — группируй по датам и считай суммы. Никогда не отвечай «не могу разделить по месяцам»: если период в вопросе не покрыт данными — скажи, какие месяцы есть, и посчитай по ним.
+- Если пользователь задал вопрос вместе с PDF/скриншотом — сначала извлеки операции в transactions, а в reply ответь на вопрос по этим операциям.
 """
 
 TOOL = {
@@ -118,9 +122,19 @@ class Claude:
             raise ClaudeError(f"Claude API {r.status_code}: {msg}")
         raise ClaudeError("Claude API недоступен")
 
+    def _system(self, context: str, instructions: str = "", extra: str = "") -> str:
+        parts = [self.system]
+        if extra:
+            parts.append(extra)
+        if instructions:
+            parts.append("=== ЛИЧНЫЕ ПРАВИЛА ПОЛЬЗОВАТЕЛЯ (соблюдай всегда) ===\n" + instructions)
+        parts.append("=== КОНТЕКСТ ПОЛЬЗОВАТЕЛЯ ===\n" + context)
+        return "\n\n".join(parts)
+
     async def process(self, context: str, text: Optional[str], history: list[dict],
                       image_bytes: Optional[bytes] = None, image_media_type: str = "image/jpeg",
-                      pdf_bytes: Optional[bytes] = None, pdf_name: str = "document.pdf") -> dict:
+                      pdf_bytes: Optional[bytes] = None, pdf_name: str = "document.pdf",
+                      instructions: str = "") -> dict:
         """Извлечь операции + сформировать ответ. Возвращает {"transactions": [...], "reply": str}."""
         import base64
 
@@ -149,29 +163,51 @@ class Claude:
         content.append({"type": "text", "text": user_text})
 
         messages = [*history, {"role": "user", "content": content}]
-        system = f"{self.system}\n\n=== КОНТЕКСТ ПОЛЬЗОВАТЕЛЯ ===\n{context}"
-        max_tokens = 8000 if pdf_bytes else 2000  # выписка может содержать сотни операций
+        system = self._system(context, instructions)
+        max_tokens = 16000 if pdf_bytes else 4000  # выписка может содержать сотни операций
         data = await self._messages(messages, system, max_tokens=max_tokens, tools=[TOOL],
                                     tool_choice={"type": "tool", "name": "process_message"})
+        truncated = data.get("stop_reason") == "max_tokens"
         for block in data.get("content", []):
             if block.get("type") == "tool_use" and block.get("name") == "process_message":
                 inp = block.get("input") or {}
                 txs = inp.get("transactions") or []
                 reply = (inp.get("reply") or "").strip()
+                if truncated:
+                    reply += "\n\n⚠️ Документ очень большой, ответ мог обрезаться — пришлите выписку за меньший период."
                 return {"transactions": [t for t in txs if isinstance(t, dict)], "reply": reply}
         # Модель ответила текстом без инструмента — вернём его как reply
         text_out = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
         return {"transactions": [], "reply": text_out.strip() or "Не понял, переформулируйте, пожалуйста."}
 
-    async def analyze(self, context: str, prompt: str, max_tokens: int = 1500) -> str:
-        """Развёрнутый анализ/совет обычным текстом."""
-        system = (
-            f"{self.system}\n\nСейчас пользователь запросил развёрнутый анализ. Можно ответить длиннее (до 12 коротких строк), "
-            f"но конкретно: цифры, проценты, что именно сократить и на сколько. Без markdown-разметки.\n\n"
-            f"=== КОНТЕКСТ ПОЛЬЗОВАТЕЛЯ ===\n{context}"
-        )
-        data = await self._messages([{"role": "user", "content": prompt}], system, max_tokens=max_tokens)
+    async def analyze(self, context: str, prompt: str, max_tokens: int = 3000, instructions: str = "",
+                      history: Optional[list[dict]] = None) -> str:
+        """Развёрнутый анализ/ответ обычным текстом (без извлечения операций)."""
+        extra = ("Сейчас пользователь запросил развёрнутый анализ или ответ на вопрос. Отвечай полно и конкретно: цифры, "
+                 "проценты, сравнения, что именно сократить и на сколько. Все суммы бери из контекста (там есть точная "
+                 "разбивка по месяцам и категориям из базы данных) — не пересчитывай на глаз. Соблюдай правила формата reply.")
+        system = self._system(context, instructions, extra)
+        messages = [*(history or []), {"role": "user", "content": prompt}]
+        data = await self._messages(messages, system, max_tokens=max_tokens)
         return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
+
+
+_BOLD = re.compile(r"\*\*(.+?)\*\*", re.S)
+_ITALIC = re.compile(r"(?<![\w*])\*(?!\s)(.+?)(?<!\s)\*(?![\w*])")
+_CODE = re.compile(r"`([^`\n]+)`")
+
+
+def to_telegram_html(text: str) -> str:
+    """Лёгкий markdown от модели -> HTML для Telegram. Сначала экранируем, потом размечаем."""
+    out = html.escape(text or "", quote=False)
+    out = _BOLD.sub(r"<b>\1</b>", out)
+    out = _CODE.sub(r"<code>\1</code>", out)
+    out = _ITALIC.sub(r"<i>\1</i>", out)
+    # заголовки вида "### Текст" и маркеры "- " / "* " -> "• "
+    out = re.sub(r"^\s{0,3}#{1,6}\s*(.+)$", r"<b>\1</b>", out, flags=re.M)
+    out = re.sub(r"^\s*[-*]\s+", "• ", out, flags=re.M)
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out.strip()
 
 
 def history_entry(role: str, text: str) -> dict:

@@ -149,7 +149,7 @@ async def run():
     req = CLAUDE_REQUESTS[-1]
     assert req["messages"][-1]["content"][0]["type"] == "document", req["messages"][-1]["content"][0]
     assert req["messages"][-1]["content"][0]["source"]["media_type"] == "application/pdf"
-    assert req["max_tokens"] == 8000
+    assert req["max_tokens"] == 16000
     out = SENT[-1]
     assert "statement.pdf" in out["text"] and "Записал (30)" in out["text"] and "и ещё 5" in out["text"], out["text"]
     cb = out["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
@@ -158,6 +158,24 @@ async def run():
     await bot.handle_update({"update_id": 10, "callback_query": {
         "id": "cb2", "from": {"id": 1}, "data": cb, "message": {"message_id": 6, "chat": {"id": 1}, "text": "x"}}})
     assert len(db.all_transactions(1)) == before - 30
+    # PDF с вопросом -> после записи идёт второй запрос (analyze), ответ форматируется в HTML
+    CLAUDE_REPLY = {"transactions": [
+        {"type": "expense", "amount": 7, "currency": "EUR", "category": "Транспорт", "description": "ridenow",
+         "date": (today - timedelta(days=40)).isoformat()}], "reply": "ok"}
+    n_req = len(CLAUDE_REQUESTS)
+    await bot.handle_update(msg(document={"file_id": "d1", "mime_type": "application/pdf",
+                                          "file_name": "st2.pdf", "file_size": 100}, caption="сколько по месяцам?"))
+    assert len(CLAUDE_REQUESTS) == n_req + 2 and "tools" not in CLAUDE_REQUESTS[-1]
+    assert "разбивка по месяцам" in CLAUDE_REQUESTS[-1]["system"], CLAUDE_REQUESTS[-1]["system"][-800:]
+    assert "меньше кофе" in SENT[-1]["text"]
+    # правила пользователя попадают в system prompt
+    await bot.handle_update(msg("/rules Отвечай абзацами с эмодзи"))
+    assert "Запомнил" in SENT[-1]["text"]
+    await bot.handle_update(msg("/rules + Переводы друзьям не траты"))
+    await bot.handle_update(msg("сколько я потратил?"))
+    assert "ЛИЧНЫЕ ПРАВИЛА" in CLAUDE_REQUESTS[-1]["system"] and "Переводы друзьям" in CLAUDE_REQUESTS[-1]["system"]
+    await bot.handle_update(msg("/months"))
+    assert "По месяцам" in SENT[-1]["text"] and "Транспорт" in SENT[-1]["text"], SENT[-1]["text"]
     # слишком большой PDF
     await bot.handle_update(msg(document={"file_id": "d2", "mime_type": "application/pdf",
                                           "file_name": "big.pdf", "file_size": 50 * 1024 * 1024}))
@@ -211,6 +229,9 @@ async def run():
                             reports.daily_totals(db.transactions_between(1, *reports.month_range(today)),
                                                  *reports.month_range(today)), "USD", "Тест", {"Еда": 100})
     open(os.path.join(tmp, "chart.png"), "wb").write(png)
+    from finbot.claude import to_telegram_html
+    h = to_telegram_html("## Итог\n**Еда** 120 € <5%\n- пункт *важно*\n* ещё `код`")
+    assert h == "<b>Итог</b>\n<b>Еда</b> 120 € &lt;5%\n• пункт <i>важно</i>\n• ещё <code>код</code>", h
     print("chart:", os.path.join(tmp, "chart.png"))
     print("OK — все проверки пройдены, сообщений отправлено:", len(SENT))
 

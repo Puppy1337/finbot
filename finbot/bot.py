@@ -9,7 +9,7 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 from . import reports
-from .claude import Claude, ClaudeError, history_entry
+from .claude import Claude, ClaudeError, history_entry, to_telegram_html
 from .config import Settings
 from .db import EXPENSE_CATEGORIES, INCOME_CATEGORIES, Database, Transaction
 from .rates import Rates, normalize_currency
@@ -27,6 +27,7 @@ COMMANDS = [
     ("today", "Траты за сегодня"),
     ("week", "Отчёт за неделю"),
     ("month", "Отчёт за месяц с графиком"),
+    ("months", "Сравнение последних месяцев"),
     ("advice", "Развёрнутый совет, как сэкономить"),
     ("budget", "Бюджеты по категориям"),
     ("goal", "Цели накопления"),
@@ -35,6 +36,7 @@ COMMANDS = [
     ("currency", "Базовая валюта"),
     ("undo", "Удалить последнюю запись"),
     ("export", "Выгрузить все данные в CSV"),
+    ("rules", "Личные правила для бота"),
 ]
 
 HELP = """<b>Как пользоваться</b>
@@ -46,7 +48,7 @@ HELP = """<b>Как пользоваться</b>
 ❓ <b>Вопросы</b>: «сколько я потратил на еду?», «хватит ли до зарплаты?», «на чём сэкономить?».
 
 <b>Команды</b>
-/today — сегодня · /week — неделя · /month — месяц + график
+/today — сегодня · /week — неделя · /month — месяц + график · /months — по месяцам
 /advice — подробный разбор и план экономии
 /budget Еда 300 — лимит на категорию в месяц (/budget — список)
 /goal Отпуск 2000 2026-12-31 — цель (/goal — список)
@@ -54,6 +56,7 @@ HELP = """<b>Как пользоваться</b>
 /remind 21:00 — ежедневное напоминание (/remind off — выключить)
 /currency EUR — базовая валюта
 /undo — удалить последнюю запись · /export — CSV со всеми данными
+/rules — ваши постоянные правила для бота (стиль ответов, что считать тратой и т.п.)
 
 Под каждой записью есть кнопка «Отменить», если бот понял неверно."""
 
@@ -203,8 +206,13 @@ class FinBot:
             await self.send_period(uid, chat_id, cur, *week_range(today), "Неделя", chart=True)
         elif cmd == "month":
             await self.send_period(uid, chat_id, cur, *month_range(today), today.strftime("Месяц %m.%Y"), chart=True)
+        elif cmd == "months":
+            n = int(arg) if arg.isdigit() and 1 <= int(arg) <= 24 else 6
+            await self.tg.send_message(chat_id, reports.months_report(self.db, uid, cur, n))
         elif cmd == "advice":
             await self.cmd_advice(uid, chat_id)
+        elif cmd == "rules":
+            await self.cmd_rules(user, chat_id, arg)
         elif cmd == "budget":
             await self.cmd_budget(uid, chat_id, cur, arg)
         elif cmd == "goal":
@@ -241,17 +249,40 @@ class FinBot:
 
     async def cmd_advice(self, uid: int, chat_id: int) -> None:
         await self.tg.send_chat_action(chat_id)
-        ctx = reports.build_context(self.db, uid, self.db.get_user(uid)["currency"], self.s.timezone)
+        u = self.db.get_user(uid)
+        ctx = reports.build_context(self.db, uid, u["currency"], self.s.timezone)
         try:
             text = await self.claude.analyze(
                 ctx,
                 "Сделай разбор моих финансов за текущий месяц: где перерасход, что необычного по сравнению с прошлым "
                 "месяцем, как идут бюджеты и цели. Дай 3–5 конкретных шагов, как сэкономить, с оценкой суммы экономии "
                 "в месяц. Если данных мало — скажи, что именно ещё стоит записывать.",
+                instructions=u["instructions"],
             )
         except ClaudeError as e:
             text = f"⚠️ Не удалось получить анализ: {e}"
-        await self.tg.send_message(chat_id, esc(text))
+        await self.tg.send_message(chat_id, to_telegram_html(text))
+
+    async def cmd_rules(self, user, chat_id: int, arg: str) -> None:
+        uid = user["user_id"]
+        current = self.db.get_user(uid)["instructions"]
+        if not arg:
+            body = f"<b>Ваши правила:</b>\n{esc(current)}" if current else "Правил пока нет."
+            await self.tg.send_message(
+                chat_id, body + "\n\nЗадать: <code>/rules текст правил</code> (можно несколько строк).\n"
+                "Добавить к существующим: <code>/rules + ещё правило</code>.\nУдалить все: <code>/rules off</code>.\n\n"
+                "Пример: <code>/rules Отвечай абзацами с эмодзи. Переводы друзьям не считай тратами. Подписки выделяй отдельно.</code>")
+            return
+        if arg.lower() in ("off", "clear", "удалить", "сброс"):
+            self.db.set_instructions(uid, "")
+            await self.tg.send_message(chat_id, "Личные правила удалены.")
+            return
+        if arg.startswith("+"):
+            new = (current + "\n" + arg[1:].strip()).strip()
+        else:
+            new = arg.strip()
+        self.db.set_instructions(uid, new[:2000])
+        await self.tg.send_message(chat_id, f"✅ Запомнил. Теперь бот всегда учитывает:\n{esc(new[:2000])}")
 
     async def cmd_budget(self, uid: int, chat_id: int, cur: str, arg: str) -> None:
         if not arg:
@@ -402,9 +433,10 @@ class FinBot:
         await self.tg.send_chat_action(chat_id)
         ctx = reports.build_context(self.db, uid, cur, tz)
         hist = self.history.setdefault(uid, [])
+        instructions = self.db.get_user(uid)["instructions"]
         try:
             result = await self.claude.process(ctx, text, hist, image_bytes=image, image_media_type=image_mime,
-                                               pdf_bytes=pdf, pdf_name=pdf_name)
+                                               pdf_bytes=pdf, pdf_name=pdf_name, instructions=instructions)
         except ClaudeError as e:
             log.error("Claude: %s", e)
             await self.tg.send_message(chat_id, f"⚠️ Не удалось связаться с аналитиком: {esc(e)}")
@@ -457,8 +489,19 @@ class FinBot:
                 parts.append("\n".join(warnings))
         elif skipped:
             parts.append(f"↩️ Все {skipped} операции уже были записаны раньше.")
+        # Если к документу был вопрос — отвечаем вторым запросом по свежей базе (точные суммы по месяцам)
+        if lines and (pdf or image) and text and len(text.strip()) > 3:
+            try:
+                fresh_ctx = reports.build_context(self.db, uid, cur, tz)
+                answer = await self.claude.analyze(
+                    fresh_ctx, f"Я только что загрузил документ «{pdf_name if pdf else 'скриншот'}», операции из него уже "
+                               f"записаны в базу (см. контекст). Мой вопрос: {text}", instructions=instructions)
+                if answer:
+                    result["reply"] = answer
+            except ClaudeError as e:
+                log.warning("follow-up analyze: %s", e)
         if result["reply"]:
-            parts.append(("💡 " if lines else "") + esc(result["reply"]))
+            parts.append(("💡 " if lines else "") + to_telegram_html(result["reply"]))
         # callback_data ограничен 64 байтами — передаём диапазон id (записи одного сообщения идут подряд)
         markup = inline_keyboard([[("↩️ Отменить", f"undo:{min(saved_ids)}-{max(saved_ids)}")]]) if saved_ids else None
         await self.tg.send_message(chat_id, "\n\n".join(p for p in parts if p).strip() or "🤔", reply_markup=markup)
@@ -540,7 +583,7 @@ class FinBot:
                     advice = await self.claude.analyze(
                         ctx, f"Прошла неделя {start.isoformat()}–{end.isoformat()}. Дай 3 коротких вывода и 1 совет на "
                              f"следующую неделю, как сэкономить.", max_tokens=600)
-                    await self._notify(uid, "💡 " + esc(advice))
+                    await self._notify(uid, "💡 " + to_telegram_html(advice))
                 except ClaudeError as e:
                     log.warning("weekly advice: %s", e)
 
